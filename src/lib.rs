@@ -3,4 +3,5 @@
 
 pub mod py;
 pub mod unicode_tables;
+pub mod vm;
 pub mod wire;

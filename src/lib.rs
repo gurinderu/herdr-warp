@@ -3,6 +3,7 @@
 
 pub mod agent;
 pub mod hook;
+pub mod pin;
 pub mod proc;
 pub mod py;
 pub mod serve;

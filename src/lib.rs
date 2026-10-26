@@ -6,6 +6,7 @@ pub mod hook;
 pub mod proc;
 pub mod py;
 pub mod serve;
+pub mod tab_title;
 pub mod unicode_tables;
 pub mod vm;
 pub mod wire;

@@ -55,7 +55,10 @@
           # The CLI tools CI runs besides Rust itself, pinned by flake.lock.
           # Workflows put them on PATH through .github/actions/setup-tools;
           # the dev shell gets the same set.
-          ciTools = [ pkgs.actionlint ];
+          ciTools = [
+            pkgs.actionlint
+            pkgs.cargo-mutants
+          ];
 
           # The legacy command names the nix-config modules use; each is a
           # symlink to the one binary, which picks the subcommand from argv[0].

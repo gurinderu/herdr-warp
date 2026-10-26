@@ -9,6 +9,9 @@ name: "ci"
 #   quality  actionlint over the workflows (quality.yml)
 #   build    nix build and nix flake check on x86_64-linux and
 #            aarch64-darwin (build.yml)
+#   mutation-diff  cargo-mutants over a PR's changed lines; advisory, PRs
+#            only, not in pr-ok (mutation-diff.yml). The weekly full run is
+#            mutation.yml, outside ci.
 #
 # GitHub-hosted runners only; no secrets.
 on:
@@ -40,6 +43,11 @@ jobs:
 
   build:
     uses: ./.github/workflows/build.yml
+
+  # Advisory: deliberately missing from pr-ok's needs (see the top).
+  mutation-diff:
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/mutation-diff.yml
 
   pr-ok:
     name: "pr-ok"

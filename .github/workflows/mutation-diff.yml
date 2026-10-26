@@ -1,0 +1,98 @@
+name: "mutation-diff"
+
+# Advisory mutation testing of the lines a pull request changes:
+# cargo-mutants with `--in-diff` over the PR's diff against its base,
+# survivors in the step summary. A surviving mutant never fails the job, and
+# ci.yml leaves the job out of `pr-ok`'s needs: it is not a merge gate. The
+# job goes red only when the run says nothing about the tests: cargo-mutants
+# errored, its baseline failed, or it did not finish in time. The weekly
+# mutation.yml still mutates everything.
+# Called by ci.yml for pull requests.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # As in mutation.yml: cargo-mutants comes from the flake's `ci-tools`, its
+  # timeouts and exclusions from .cargo/mutants.toml.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  mutants:
+    name: "mutants in diff (advisory)"
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    # The mutate step has its own, shorter limit, so the summary still runs.
+    timeout-minutes: 90
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-targets: "false"
+          shared-key: mutation
+          save-if: false
+
+      - name: Setup project tools
+        uses: ./.github/actions/setup-tools
+
+      - name: Diff against the merge base
+        id: diff
+        run: |
+          mb="$(git merge-base "$BASE_SHA" HEAD)"
+          git diff "$mb" HEAD -- '*.rs' > "$RUNNER_TEMP/pr.diff"
+          echo "lines=$(grep -c . "$RUNNER_TEMP/pr.diff" || true)" >> "$GITHUB_OUTPUT"
+
+      - name: Mutate the diff
+        id: mutate
+        if: steps.diff.outputs.lines != '0'
+        timeout-minutes: 75
+        run: |
+          cargo mutants -j 2 --in-diff "$RUNNER_TEMP/pr.diff"
+          rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          # 0 all caught, 2 missed, 3 timeouts: the run says something. 1
+          # (usage) and 4 (baseline failed) do not.
+          case "$rc" in 0|2|3) exit 0 ;; *) exit "$rc" ;; esac
+        shell: bash {0}
+
+      - name: Summarise
+        if: ${{ !cancelled() }}
+        env:
+          LINES: ${{ steps.diff.outputs.lines }}
+          RC: ${{ steps.mutate.outputs.rc }}
+        run: |
+          {
+            echo "## Mutants in this PR's diff (advisory)"
+            if [ "$LINES" = "0" ]; then
+              echo "No Rust lines changed."
+            elif [ -z "$RC" ]; then
+              echo "cargo-mutants did not finish."
+            else
+              for k in caught missed timeout unviable; do
+                n=$(grep -c . "mutants.out/$k.txt" 2>/dev/null || true)
+                echo "- $k: ${n:-0}"
+              done
+              if [ -s mutants.out/missed.txt ]; then
+                echo
+                echo "### Missed"
+                echo '```'
+                cat mutants.out/missed.txt
+                echo '```'
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

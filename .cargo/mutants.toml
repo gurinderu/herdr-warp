@@ -1,0 +1,35 @@
+# cargo-mutants configuration, read by .github/workflows/mutation.yml and
+# mutation-diff.yml (and by a local `cargo mutants`).
+
+# Some tests wait on real timeouts (the herdr socket's 2 s, a live stream's
+# heartbeat), so leave room before a slow but valid run counts as a hang.
+timeout_multiplier = 5.0
+minimum_test_timeout = 30
+
+exclude_globs = [
+    # Generated data (tools/gen-unicode-tables.py), not logic.
+    "src/unicode_tables.rs",
+]
+
+# Matched against the mutant's name, e.g. "replace send_focus with ()" or
+# "replace > with >= in Agent::read_session".
+exclude_re = [
+    # The real-world wiring the tests replace with fakes: process entry
+    # points, the reconnect loop, the ps-based tty lookup and the thread
+    # that polls the frontmost app. Covered end to end by
+    # parity/test_parity.py, which cargo-mutants does not run.
+    "replace main( |$)",
+    " in main$",
+    "Agent::run\\b",
+    "Hooks::real\\b",
+    "replace find_tty\\b",
+    " in find_tty$",
+    "jump_loop",
+    "replace send_focus with",
+    "replace front_bundle ->",
+    "replace log with",
+    "replace arg_error\\b",
+    " in arg_error$",
+    # serde's required error-message hook.
+    "::expecting\\b",
+]

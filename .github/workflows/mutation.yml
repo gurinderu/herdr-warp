@@ -1,0 +1,98 @@
+name: mutation
+
+# Mutation testing of the whole crate. Slow, so it runs out of band rather
+# than on every PR: weekly and on demand. Survivors land in the run's step
+# summary and the mutants.out artifact; a surviving mutant turns the job red
+# as a signal to triage, never as a merge block (this workflow is not part of
+# ci.yml). mutation-diff.yml covers a PR's own lines.
+on:
+  schedule:
+    # Mondays 06:17 UTC (odd minute to dodge top-of-hour runner congestion).
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+# Queue, never cancel: a dispatch arriving mid-way must not kill the weekly
+# run, so the schedule and dispatches get groups of their own.
+concurrency:
+  group: mutation-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # cargo-mutants comes from the flake's `ci-tools`, pinned by flake.lock: the
+  # summary below reads its mutants.out/*.txt lists and its exit codes
+  # (2 missed, 3 timeout, 4 baseline failed), which may change between
+  # versions. Config (timeouts, exclusions) is in .cargo/mutants.toml.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  mutants:
+    name: mutants
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # cargo-mutants builds in its own scratch copy of the tree, so a
+          # cached ./target would never be read: only the registry is worth
+          # restoring.
+          cache-targets: "false"
+          shared-key: mutation
+
+      - name: Setup project tools
+        uses: ./.github/actions/setup-tools
+
+      - name: Mutate
+        run: |
+          cargo mutants -j 2
+          rc=$?
+          # Written only once cargo-mutants has returned, so a run killed at
+          # the time limit is told apart from a finished one.
+          mkdir -p mutants.out
+          echo "$rc" > mutants.out/exit-code
+          exit "$rc"
+        shell: bash {0}
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "## Mutation testing"
+            if [ ! -f mutants.out/exit-code ]; then
+              echo "cargo-mutants did not finish."
+            else
+              for k in caught missed timeout unviable; do
+                n=$(grep -c . "mutants.out/$k.txt" 2>/dev/null || true)
+                echo "- $k: ${n:-0}"
+              done
+              if [ -s mutants.out/missed.txt ]; then
+                echo
+                echo "### Missed"
+                echo '```'
+                cat mutants.out/missed.txt
+                echo '```'
+              fi
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload mutants.out
+        # Always: a clean run's lists tell "zero survivors" from "never ran".
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-out
+          path: mutants.out/
+          retention-days: 7
+          if-no-files-found: warn

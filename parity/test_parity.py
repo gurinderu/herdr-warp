@@ -483,12 +483,15 @@ class Parity(unittest.TestCase):
         self.assertEqual((calls, state), ("", None))
 
     def test_agent_bad_args(self):
+        """Exit codes for a bad or missing option and for --help. The texts
+        differ by design: argparse in Python, argh in Rust."""
         def scenario(impl):
-            r = run(argv(impl, "agent") + ["--host", "x", "--port", "y"], {"PATH": "/usr/bin:/bin"})
-            # The program name in the usage text differs (agent.py vs the
-            # command name); the error itself must not.
-            return r.returncode, r.stderr.decode().splitlines()[-1].split(": error: ", 1)[1]
-        self.assertEqual(self.both(scenario)[0], 2)
+            codes = []
+            for args in (["--host", "x"], ["--host", "x", "--port", "y"], ["--help"]):
+                r = run(argv(impl, "agent") + args, {"PATH": "/usr/bin:/bin"})
+                codes.append(r.returncode)
+            return codes
+        self.assertEqual(self.both(scenario), [2, 2, 0])
 
     # ------------------------------------------------------------ tab-title
 

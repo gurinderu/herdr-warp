@@ -31,6 +31,7 @@
 use crate::proc::{self, RunError};
 use crate::py;
 use crate::wire::{self, Event, MAX_LINE_BYTES, Msg};
+use argh::FromArgs;
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -231,7 +232,8 @@ pub fn write_tty(path: &str, data: &[u8]) -> Result<bool, String> {
     Ok(n as usize == data.len())
 }
 
-fn run_text(argv: &[&str], timeout: Duration) -> Option<String> {
+/// stdout of `argv` (whatever its exit status), None if it could not run.
+pub fn run_text(argv: &[&str], timeout: Duration) -> Option<String> {
     let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
     proc::run(&argv, timeout)
         .ok()
@@ -240,11 +242,16 @@ fn run_text(argv: &[&str], timeout: Duration) -> Option<String> {
 
 /// Bundle id of the frontmost app ("" if unknown), None without lsappinfo.
 pub fn front_bundle() -> Option<String> {
+    front_bundle_with("/usr/bin/lsappinfo")
+}
+
+/// [`front_bundle`] with the lsappinfo binary given.
+pub fn front_bundle_with(lsappinfo: &str) -> Option<String> {
     let t = Duration::from_secs(3);
-    let asn = run_text(&["/usr/bin/lsappinfo", "front"], t)?;
+    let asn = run_text(&[lsappinfo, "front"], t)?;
     let info = run_text(
         &[
-            "/usr/bin/lsappinfo",
+            lsappinfo,
             "info",
             "-only",
             "bundleid",
@@ -283,163 +290,98 @@ pub struct Config {
     pub focus_on_click: bool,
 }
 
-const USAGE: &str = "usage: herdr-notify-agent [-h] --host HOST [--port PORT] --user USER --key KEY\n                          --known-hosts KNOWN_HOSTS --host-key-alias HOST_KEY_ALIAS\n                          --vm-addr VM_ADDR --state-dir STATE_DIR [--ssh SSH]\n                          [--max-age MAX_AGE] [--jump-window JUMP_WINDOW]\n                          [--warp-bundle-prefix WARP_BUNDLE_PREFIX]\n                          [--no-focus-on-click]";
-
-const HELP: &str = "\nMac side of herdr-notify: stream agent events from the VM, show them via Warp.\n\noptions:\n  -h, --help            show this help message and exit\n  --host HOST\n  --port PORT\n  --user USER\n  --key KEY\n  --known-hosts KNOWN_HOSTS\n  --host-key-alias HOST_KEY_ALIAS\n  --vm-addr VM_ADDR     host spelling a mosh-client to the VM may carry (repeatable)\n  --state-dir STATE_DIR\n  --ssh SSH\n  --max-age MAX_AGE\n  --jump-window JUMP_WINDOW\n  --warp-bundle-prefix WARP_BUNDLE_PREFIX\n  --no-focus-on-click";
+/// Mac side of herdr-notify: stream agent events from the VM, show them via
+/// Warp.
+#[derive(FromArgs, Debug, PartialEq)]
+#[argh(subcommand, name = "agent")]
+pub struct Args {
+    /// the VM's address
+    #[argh(option)]
+    pub host: String,
+    /// ssh port
+    #[argh(option, default = "22")]
+    pub port: i64,
+    /// user on the VM
+    #[argh(option)]
+    pub user: String,
+    /// private key of the dedicated ssh key
+    #[argh(option)]
+    pub key: String,
+    /// known_hosts file pinning the VM's host key
+    #[argh(option)]
+    pub known_hosts: String,
+    /// host name the pinned key is listed under
+    #[argh(option)]
+    pub host_key_alias: String,
+    /// host spelling a mosh-client to the VM may carry (repeatable, at
+    /// least one)
+    #[argh(option)]
+    pub vm_addr: Vec<String>,
+    /// where state.json lives
+    #[argh(option)]
+    pub state_dir: String,
+    /// the ssh binary
+    #[argh(option, default = "String::from(\"/usr/bin/ssh\")")]
+    pub ssh: String,
+    /// events older than this many seconds are not shown
+    #[argh(option, default = "900")]
+    pub max_age: i64,
+    /// seconds after a notification during which bringing Warp to the front
+    /// focuses the agent's pane
+    #[argh(option, default = "600")]
+    pub jump_window: i64,
+    /// bundle id prefix that identifies Warp
+    #[argh(option, default = "String::from(\"dev.warp.\")")]
+    pub warp_bundle_prefix: String,
+    /// do not focus the pane when Warp comes to the front
+    #[argh(switch)]
+    pub no_focus_on_click: bool,
+}
 
 /// A parse failure: (message, exit code). Exit 0 is `--help`.
 #[derive(Debug)]
 pub struct ArgError(pub String, pub i32);
 
-const OPTS: [&str; 14] = [
-    "--host",
-    "--port",
-    "--user",
-    "--key",
-    "--known-hosts",
-    "--host-key-alias",
-    "--vm-addr",
-    "--state-dir",
-    "--ssh",
-    "--max-age",
-    "--jump-window",
-    "--warp-bundle-prefix",
-    "--no-focus-on-click",
-    "--help",
-];
+impl TryFrom<Args> for Config {
+    type Error = ArgError;
 
-fn looks_negative(s: &str) -> bool {
-    s.strip_prefix('-')
-        .is_some_and(|r| !r.is_empty() && r.parse::<f64>().is_ok())
+    fn try_from(a: Args) -> Result<Config, ArgError> {
+        if a.vm_addr.is_empty() {
+            return Err(ArgError(
+                "Required options not provided:\n    --vm-addr".into(),
+                2,
+            ));
+        }
+        Ok(Config {
+            host: a.host,
+            port: a.port,
+            user: a.user,
+            key: a.key,
+            known_hosts: a.known_hosts,
+            host_key_alias: a.host_key_alias,
+            vm_addr: a.vm_addr,
+            state_dir: a.state_dir,
+            ssh: a.ssh,
+            max_age: a.max_age,
+            jump_window: a.jump_window,
+            warp_bundle_prefix: a.warp_bundle_prefix,
+            focus_on_click: !a.no_focus_on_click,
+        })
+    }
 }
 
-/// argparse-compatible parsing of the agent's options (long options, also as
-/// `--opt=value`, unique prefixes accepted).
+/// Parse the agent's options as `name` would get them (argh; exit code 2 on
+/// a bad command line, like argparse).
+pub fn parse_config_as(name: &str, argv: &[String]) -> Result<Config, ArgError> {
+    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+    match Args::from_args(&[name], &argv) {
+        Ok(a) => Config::try_from(a),
+        Err(e) => Err(ArgError(e.output, if e.status.is_ok() { 0 } else { 2 })),
+    }
+}
+
 pub fn parse_config(argv: &[String]) -> Result<Config, ArgError> {
-    let err = |m: String| ArgError(format!("{USAGE}\nherdr-notify-agent: error: {m}"), 2);
-    let mut vals: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    let mut extra = Vec::new();
-    let mut i = 0;
-    while i < argv.len() {
-        let a = &argv[i];
-        i += 1;
-        if a == "-h" {
-            return Err(ArgError(format!("{USAGE}\n{HELP}"), 0));
-        }
-        if !a.starts_with("--") || a == "--" {
-            extra.push(a.clone());
-            continue;
-        }
-        let (name, inline) = match a.split_once('=') {
-            Some((n, v)) => (n, Some(v.to_string())),
-            None => (a.as_str(), None),
-        };
-        let opt = match OPTS.iter().find(|o| **o == name) {
-            Some(o) => *o,
-            None => {
-                let m: Vec<&&str> = OPTS.iter().filter(|o| o.starts_with(name)).collect();
-                match m.len() {
-                    1 => m[0],
-                    0 => {
-                        extra.push(a.clone());
-                        continue;
-                    }
-                    _ => {
-                        let names: Vec<&str> = m.iter().map(|s| **s).collect();
-                        return Err(err(format!(
-                            "ambiguous option: {name} could match {}",
-                            names.join(", ")
-                        )));
-                    }
-                }
-            }
-        };
-        if opt == "--help" {
-            return Err(ArgError(format!("{USAGE}\n{HELP}"), 0));
-        }
-        if opt == "--no-focus-on-click" {
-            if inline.is_some() {
-                return Err(err(format!("argument {opt}: ignored explicit argument")));
-            }
-            vals.entry(opt).or_default().push(String::new());
-            continue;
-        }
-        let value = match inline {
-            Some(v) => v,
-            None => match argv.get(i) {
-                Some(v) if !v.starts_with('-') || looks_negative(v) => {
-                    i += 1;
-                    v.clone()
-                }
-                _ => return Err(err(format!("argument {opt}: expected one argument"))),
-            },
-        };
-        // argparse converts (and rejects) a typed value as soon as it is
-        // read, before it checks for missing options.
-        if matches!(opt, "--port" | "--max-age" | "--jump-window")
-            && value.trim_matches(py::is_space).parse::<i64>().is_err()
-        {
-            return Err(err(format!(
-                "argument {opt}: invalid int value: {}",
-                py::repr_str(&value)
-            )));
-        }
-        vals.entry(opt).or_default().push(value);
-    }
-    let required = [
-        "--host",
-        "--user",
-        "--key",
-        "--known-hosts",
-        "--host-key-alias",
-        "--vm-addr",
-        "--state-dir",
-    ];
-    let missing: Vec<&str> = required
-        .iter()
-        .copied()
-        .filter(|r| !vals.contains_key(r))
-        .collect();
-    if !missing.is_empty() {
-        return Err(err(format!(
-            "the following arguments are required: {}",
-            missing.join(", ")
-        )));
-    }
-    if !extra.is_empty() {
-        return Err(err(format!("unrecognized arguments: {}", extra.join(" "))));
-    }
-    let last = |k: &str, d: &str| {
-        vals.get(k)
-            .and_then(|v| v.last().cloned())
-            .unwrap_or_else(|| d.to_string())
-    };
-    let int = |k: &str, d: i64| -> Result<i64, ArgError> {
-        match vals.get(k).and_then(|v| v.last()) {
-            None => Ok(d),
-            Some(v) => v.trim_matches(py::is_space).parse().map_err(|_| {
-                err(format!(
-                    "argument {k}: invalid int value: {}",
-                    py::repr_str(v)
-                ))
-            }),
-        }
-    };
-    Ok(Config {
-        host: last("--host", ""),
-        port: int("--port", 22)?,
-        user: last("--user", ""),
-        key: last("--key", ""),
-        known_hosts: last("--known-hosts", ""),
-        host_key_alias: last("--host-key-alias", ""),
-        vm_addr: vals.get("--vm-addr").cloned().unwrap_or_default(),
-        state_dir: last("--state-dir", ""),
-        ssh: last("--ssh", "/usr/bin/ssh"),
-        max_age: int("--max-age", 900)?,
-        jump_window: int("--jump-window", 600)?,
-        warp_bundle_prefix: last("--warp-bundle-prefix", "dev.warp."),
-        focus_on_click: !vals.contains_key("--no-focus-on-click"),
-    })
+    parse_config_as("herdr-notify-agent", argv)
 }
 
 /// The fixed ssh command line; only `remote_cmd` varies.
@@ -521,45 +463,49 @@ pub fn find_tty(cfg: &Config) -> Option<String> {
     choose_tty(&warp_candidates(&procs, &args, &vm), &stat_tty, uid)
 }
 
-fn py_exit_code(st: std::process::ExitStatus) -> i32 {
+/// Python's `returncode`: the exit status, or minus the signal.
+pub fn py_exit_code(st: std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     st.code().or_else(|| st.signal().map(|s| -s)).unwrap_or(-1)
 }
 
 /// Ask the VM to focus `pane` (if it still hosts `term`) over the same key.
 pub fn send_focus(cfg: &Config, pane: &str, term: &str) {
+    if let Some(line) = focus_request(cfg, pane, term) {
+        log(&line);
+    }
+}
+
+/// The focus request proper: the log line it produces, or None when the ids
+/// do not validate (nothing is run then).
+pub fn focus_request(cfg: &Config, pane: &str, term: &str) -> Option<String> {
     // Re-validate: these came off the wire, even if parse_line passed them.
     if !(wire::is_id(pane) && wire::is_term(term)) {
-        return;
+        return None;
     }
     let argv = ssh_argv(cfg, &format!("focus {pane} {term}"));
     let res = match proc::run(&argv, FOCUS_TIMEOUT) {
         Ok(r) => r,
         Err(RunError::Spawn(e)) => {
-            log(&format!(
+            return Some(format!(
                 "focus {pane}: {}",
                 py::os_error(&e, Some(&cfg.ssh))
             ));
-            return;
         }
         Err(RunError::Timeout) => {
             let list = serde_json::Value::from(argv.clone());
-            log(&format!(
+            return Some(format!(
                 "focus {pane}: Command '{}' timed out after {:.1} seconds",
                 py::repr_value(&list),
                 FOCUS_TIMEOUT.as_secs_f64()
             ));
-            return;
         }
     };
     let line = res.stdout.split(|&b| b == b'\n').next().unwrap_or_default();
-    match wire::parse_line(line, crate::vm::now()) {
-        Ok(m) => log(&format!("focus {pane}: {}", m.py_repr())),
-        Err(e) => log(&format!(
-            "focus {pane}: exit {}, {e}",
-            py_exit_code(res.status)
-        )),
-    }
+    Some(match wire::parse_line(line, crate::vm::now()) {
+        Ok(m) => format!("focus {pane}: {}", m.py_repr()),
+        Err(e) => format!("focus {pane}: exit {}, {e}", py_exit_code(res.status)),
+    })
 }
 
 impl Hooks {
@@ -676,20 +622,31 @@ fn jump_loop(cfg: Arc<Config>, hooks: Hooks, jump: Arc<Jump>) {
     }
 }
 
-struct Rng(u64);
+/// Jitter for the reconnect delay (xorshift64; no crate for this).
+pub struct Rng(u64);
+
+impl Default for Rng {
+    fn default() -> Rng {
+        Rng::new()
+    }
+}
 
 impl Rng {
-    fn new() -> Rng {
+    pub fn new() -> Rng {
         let mut b = [0u8; 8];
         let seed = fs::File::open("/dev/urandom")
             .and_then(|mut f| f.read_exact(&mut b))
             .map(|_| u64::from_le_bytes(b))
             .unwrap_or_else(|_| crate::vm::now().to_bits() ^ u64::from(std::process::id()));
+        Rng::seeded(seed)
+    }
+
+    pub fn seeded(seed: u64) -> Rng {
         Rng(seed | 1)
     }
 
     /// random.uniform(a, b)
-    fn uniform(&mut self, a: f64, b: f64) -> f64 {
+    pub fn uniform(&mut self, a: f64, b: f64) -> f64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
@@ -707,6 +664,8 @@ pub struct Agent {
     pub suppressed: u64,
     pub last_summary: f64,
     pub jump: Arc<Jump>,
+    /// How long one poll of the ssh pipe waits (tests shorten it).
+    pub select_seconds: f64,
 }
 
 impl Agent {
@@ -723,6 +682,7 @@ impl Agent {
             suppressed: 0,
             last_summary: 0.0,
             jump: Arc::new(Jump::default()),
+            select_seconds: SELECT_SECONDS,
         };
         a.load_state();
         a
@@ -943,7 +903,7 @@ impl Agent {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            let rc = unsafe { libc::poll(&mut pfd, 1, (SELECT_SECONDS * 1000.0) as i32) };
+            let rc = unsafe { libc::poll(&mut pfd, 1, (self.select_seconds * 1000.0) as i32) };
             if rc < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() != io::ErrorKind::Interrupted {
@@ -1053,17 +1013,21 @@ impl Agent {
     }
 }
 
-pub fn main(args: &[String]) -> i32 {
-    let cfg = match parse_config(args) {
+/// Report a bad command line (stdout for `--help`) and give its exit code.
+pub fn arg_error(e: ArgError) -> i32 {
+    if e.1 == 0 {
+        println!("{}", e.0);
+    } else {
+        eprintln!("{}", e.0);
+    }
+    e.1
+}
+
+/// Run the agent; returns only when it gives up (no key yet).
+pub fn main(args: Args) -> i32 {
+    let cfg = match Config::try_from(args) {
         Ok(c) => c,
-        Err(ArgError(msg, code)) => {
-            if code == 0 {
-                println!("{msg}");
-            } else {
-                eprintln!("{msg}");
-            }
-            return code;
-        }
+        Err(e) => return arg_error(e),
     };
     let cfg_arc = Arc::new(cfg.clone());
     let hooks = Hooks::real(&cfg_arc);

@@ -197,18 +197,10 @@ pub fn repr_value(v: &Value) -> String {
         Value::Null => "None".into(),
         Value::Bool(true) => "True".into(),
         Value::Bool(false) => "False".into(),
-        Value::Number(n) => {
-            if n.is_f64() {
-                let f = n.as_f64().unwrap_or(0.0);
-                if f.fract() == 0.0 && f.abs() < 1e16 {
-                    format!("{f:.1}")
-                } else {
-                    format!("{f}")
-                }
-            } else {
-                n.to_string()
-            }
-        }
+        Value::Number(n) => match n.as_f64() {
+            Some(f) if n.is_f64() => repr_float(f),
+            _ => n.to_string(),
+        },
         Value::String(s) => repr_str(s),
         Value::Array(a) => {
             let items: Vec<String> = a.iter().map(repr_value).collect();
@@ -221,6 +213,25 @@ pub fn repr_value(v: &Value) -> String {
                 .collect();
             format!("{{{}}}", items.join(", "))
         }
+    }
+}
+
+/// Python `repr()` of a float: shortest round-trip digits, exponent form
+/// from 1e16 up and below 1e-4, at least two exponent digits.
+pub fn repr_float(f: f64) -> String {
+    let a = f.abs();
+    if a != 0.0 && !(1e-4..1e16).contains(&a) {
+        let e = format!("{f:e}");
+        let (mant, exp) = e.split_once('e').unwrap_or((&e, "0"));
+        let (sign, digits) = match exp.strip_prefix('-') {
+            Some(d) => ('-', d),
+            None => ('+', exp),
+        };
+        format!("{mant}e{sign}{digits:0>2}")
+    } else if f.fract() == 0.0 {
+        format!("{f:.1}")
+    } else {
+        format!("{f}")
     }
 }
 
@@ -291,7 +302,7 @@ fn split(p: &str) -> (String, String) {
 }
 
 /// posixpath.normpath
-fn normpath(p: &str) -> String {
+pub fn normpath(p: &str) -> String {
     if p.is_empty() {
         return ".".into();
     }

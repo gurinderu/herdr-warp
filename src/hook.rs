@@ -230,7 +230,13 @@ pub fn run(env: &Env, sleep: &dyn Fn(f64), clock: &dyn Fn() -> f64, call: Call) 
     0
 }
 
-pub fn main(_args: &[String]) -> i32 {
+/// herdr plugin hook: spool done/needs-input agent events for the Mac
+/// notifier (VM).
+#[derive(argh::FromArgs, Debug, Default, PartialEq)]
+#[argh(subcommand, name = "hook")]
+pub struct Args {}
+
+pub fn main() -> i32 {
     let env = vm::os_env();
     let sleep = |s: f64| std::thread::sleep(std::time::Duration::from_secs_f64(s));
     run(&env, &sleep, &vm::now, &vm::herdr_call)

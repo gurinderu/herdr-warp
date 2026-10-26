@@ -129,36 +129,64 @@ fn py_json(v: &Value) -> String {
     out
 }
 
-/// The request line herdr_call sends.
+/// The request line herdr_call sends (byte-for-byte what the Python sent).
 pub fn request_line(method: &str, params: &Value) -> String {
+    request_line_id("herdr-notify", method, params)
+}
+
+/// A request line with Python's `json.dumps` spacing.
+pub fn request_line_id(id: &str, method: &str, params: &Value) -> String {
     format!(
-        "{{\"id\": \"herdr-notify\", \"method\": {}, \"params\": {}}}\n",
+        "{{\"id\": {}, \"method\": {}, \"params\": {}}}\n",
+        py_json(&Value::String(id.into())),
         py_json(&Value::String(method.into())),
         py_json(params)
     )
 }
 
-/// One request over herdr's socket API; the decoded reply, or None.
-pub fn herdr_call(path: &Path, method: &str, params: Value) -> Option<Value> {
-    let mut sock = UnixStream::connect(path).ok()?;
-    sock.set_read_timeout(Some(SOCKET_TIMEOUT)).ok()?;
-    sock.set_write_timeout(Some(SOCKET_TIMEOUT)).ok()?;
-    sock.write_all(request_line(method, &params).as_bytes())
-        .ok()?;
+/// Why a socket request gave no reply.
+#[derive(Debug)]
+pub enum CallError {
+    /// Nothing listens there (no socket, or refused): herdr is not reachable
+    /// this way at all.
+    Connect(io::Error),
+    /// Connected, but the exchange failed or the reply was not JSON.
+    Exchange(String),
+}
+
+/// One request over herdr's socket API; the decoded first reply line.
+pub fn herdr_request(
+    path: &Path,
+    id: &str,
+    method: &str,
+    params: &Value,
+    timeout: Duration,
+) -> Result<Value, CallError> {
+    let mut sock = UnixStream::connect(path).map_err(CallError::Connect)?;
+    let ex = |e: io::Error| CallError::Exchange(e.to_string());
+    sock.set_read_timeout(Some(timeout)).map_err(ex)?;
+    sock.set_write_timeout(Some(timeout)).map_err(ex)?;
+    sock.write_all(request_line_id(id, method, params).as_bytes())
+        .map_err(ex)?;
     let mut buf = Vec::new();
     let mut chunk = vec![0u8; 65536];
-    while !buf.contains(&b'\n') && buf.len() < MAX_REPLY_BYTES {
-        let n = sock.read(&mut chunk).ok()?;
+    while buf.len() < MAX_REPLY_BYTES {
+        let n = sock.read(&mut chunk).map_err(ex)?;
         if n == 0 {
             break;
         }
         buf.extend_from_slice(&chunk[..n]);
-    }
-    if buf.is_empty() {
-        return None;
+        if chunk[..n].contains(&b'\n') {
+            break;
+        }
     }
     let line = buf.split(|&b| b == b'\n').next().unwrap_or_default();
-    serde_json::from_slice(line).ok()
+    serde_json::from_slice(line).map_err(|e| CallError::Exchange(e.to_string()))
+}
+
+/// One request over herdr's socket API; the decoded reply, or None.
+pub fn herdr_call(path: &Path, method: &str, params: Value) -> Option<Value> {
+    herdr_request(path, "herdr-notify", method, &params, SOCKET_TIMEOUT).ok()
 }
 
 /// 8 random bytes as 16 hex digits.

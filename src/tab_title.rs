@@ -19,9 +19,10 @@
 use crate::hook::trace;
 use crate::proc::{self, RunError};
 use crate::py::{self, Raised, get};
-use crate::vm::{self, Env};
+use crate::vm::{self, CallError, Env};
+use argh::FromArgs;
 use serde::de::{Deserializer, MapAccess, Visitor};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::fs::{self, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -160,46 +161,23 @@ impl Labels {
     pub fn parse(text: &str) -> Labels {
         struct V;
         impl<'de> Visitor<'de> for V {
-            type Value = Option<Labels>;
+            type Value = Labels;
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a JSON value")
+                f.write_str("a JSON object")
             }
             fn visit_map<A: MapAccess<'de>>(self, mut m: A) -> Result<Self::Value, A::Error> {
                 let mut l = Labels::default();
                 while let Some((k, v)) = m.next_entry::<String, Value>()? {
                     l.set(&k, v);
                 }
-                Ok(Some(l))
-            }
-            fn visit_seq<A: serde::de::SeqAccess<'de>>(
-                self,
-                mut s: A,
-            ) -> Result<Self::Value, A::Error> {
-                while s.next_element::<Value>()?.is_some() {}
-                Ok(None)
-            }
-            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
-                Ok(None)
-            }
-            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
-                Ok(None)
-            }
-            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
-                Ok(None)
-            }
-            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
-                Ok(None)
-            }
-            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
-                Ok(None)
-            }
-            fn visit_unit<E>(self) -> Result<Self::Value, E> {
-                Ok(None)
+                Ok(l)
             }
         }
         let mut de = serde_json::Deserializer::from_str(text);
-        match de.deserialize_any(V) {
-            Ok(Some(l)) if de.end().is_ok() => l,
+        // Anything but an object fails to deserialize (the visitor takes
+        // maps only), and so does trailing garbage.
+        match de.deserialize_map(V) {
+            Ok(l) if de.end().is_ok() => l,
             _ => Labels::default(),
         }
     }
@@ -384,7 +362,7 @@ fn argv_repr(argv: &[String]) -> String {
 }
 
 /// `herdr <args>` with check=True; Err carries Python's exception text.
-fn herdr(bin: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+fn herdr_cli(bin: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     let mut argv = vec![bin.to_string()];
     argv.extend(args.iter().map(|s| s.to_string()));
     match proc::run(&argv, TIMEOUT) {
@@ -403,44 +381,88 @@ fn herdr(bin: &str, args: &[&str]) -> Result<Vec<u8>, String> {
     }
 }
 
-fn snapshot(bin: &str) -> Result<Map<String, Value>, String> {
-    let out = herdr(bin, &["api", "snapshot"])?;
-    let v: Value = serde_json::from_slice(&out).map_err(|e| format!("bad snapshot json: {e}"))?;
-    match v.get("result").and_then(|r| r.get("snapshot")) {
+/// How this run talks to herdr: its socket API directly (no process
+/// spawned), or, when no socket answers, the `herdr` CLI as the Python did.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Herdr {
+    Socket(PathBuf),
+    Cli(String),
+}
+
+const REQUEST_ID: &str = "herdr-tab-title";
+
+fn snapshot_of(reply: &Value) -> Result<Map<String, Value>, String> {
+    match reply.get("result").and_then(|r| r.get("snapshot")) {
         Some(Value::Object(m)) => Ok(m.clone()),
         _ => Err("no snapshot in reply".into()),
     }
 }
 
-pub struct Opts {
-    pub dry_run: bool,
-    pub all: bool,
-}
-
-/// Parse the command line: `--dry-run` anywhere; `--all` must then be the
-/// only other argument (as in the Python hook's `sys.argv[1:] == ["--all"]`).
-pub fn parse_args(args: &[String]) -> Opts {
-    let dry_run = args.iter().any(|a| a == "--dry-run");
-    let rest: Vec<&String> = args.iter().filter(|a| *a != "--dry-run").collect();
-    Opts {
-        dry_run,
-        all: rest.len() == 1 && rest[0] == "--all",
+/// The session snapshot, and the way it was reached (used for the renames
+/// too). The socket is `$HERDR_SOCKET_PATH`, which herdr sets for plugin
+/// hooks, else the default session's.
+pub fn snapshot(env: &Env) -> Result<(Map<String, Value>, Herdr), String> {
+    let sock = env
+        .get("HERDR_SOCKET_PATH")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| vm::default_socket(env));
+    match vm::herdr_request(&sock, REQUEST_ID, "session.snapshot", &json!({}), TIMEOUT) {
+        Ok(reply) => Ok((snapshot_of(&reply)?, Herdr::Socket(sock))),
+        Err(CallError::Exchange(e)) => Err(format!("herdr socket: {e}")),
+        Err(CallError::Connect(_)) => {
+            let bin = env
+                .get("HERDR_BIN_PATH")
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| "herdr".into());
+            let out = herdr_cli(&bin, &["api", "snapshot"])?;
+            let v: Value =
+                serde_json::from_slice(&out).map_err(|e| format!("bad snapshot json: {e}"))?;
+            Ok((snapshot_of(&v)?, Herdr::Cli(bin)))
+        }
     }
 }
 
+/// Rename one tab the same way the snapshot was read.
+pub fn rename(h: &Herdr, tab_id: &str, label: &str) -> Result<(), String> {
+    match h {
+        Herdr::Cli(bin) => herdr_cli(bin, &["tab", "rename", tab_id, label]).map(|_| ()),
+        Herdr::Socket(sock) => {
+            let params = json!({"tab_id": tab_id, "label": label});
+            match vm::herdr_request(sock, REQUEST_ID, "tab.rename", &params, TIMEOUT) {
+                Ok(r) if r.get("result").is_some() => Ok(()),
+                Ok(r) => Err(format!(
+                    "herdr refused tab.rename: {}",
+                    r.get("error").map(Value::to_string).unwrap_or_default()
+                )),
+                Err(CallError::Connect(e)) => Err(py::os_error(&e, None)),
+                Err(CallError::Exchange(e)) => Err(format!("herdr socket: {e}")),
+            }
+        }
+    }
+}
+
+/// Name herdr tabs after what their agent is doing (a herdr plugin hook).
+#[derive(FromArgs, Debug, Default, PartialEq)]
+#[argh(subcommand, name = "tab-title")]
+pub struct Args {
+    /// handle every tab, not only the event's (as on `startup`)
+    #[argh(switch)]
+    pub all: bool,
+    /// print the renames it would make and change nothing
+    #[argh(switch)]
+    pub dry_run: bool,
+}
+
 /// The hook proper. Errors are traced (unless dry-run) and swallowed.
-pub fn run(env: &Env, opts: &Opts, out: &mut dyn std::io::Write) -> Result<(), String> {
+pub fn run(env: &Env, opts: &Args, out: &mut dyn std::io::Write) -> Result<(), String> {
     let state = state_dir(env);
     let tr = |m: &str| {
         if !opts.dry_run {
             trace(&state, m);
         }
     };
-    let bin = env
-        .get("HERDR_BIN_PATH")
-        .filter(|s| !s.is_empty())
-        .cloned()
-        .unwrap_or_else(|| "herdr".into());
     let event = env
         .get("HERDR_PLUGIN_EVENT")
         .filter(|s| !s.is_empty())
@@ -476,7 +498,7 @@ pub fn run(env: &Env, opts: &Opts, out: &mut dyn std::io::Write) -> Result<(), S
         }
         Some(f)
     };
-    let snap = snapshot(&bin)?;
+    let (snap, herdr) = snapshot(env)?;
     let mut only: Option<Value> = tab_id.map(Value::String);
     if !everything && only.is_none() {
         let mut found = None;
@@ -518,8 +540,8 @@ pub fn run(env: &Env, opts: &Opts, out: &mut dyn std::io::Write) -> Result<(), S
             );
             continue;
         }
-        match herdr(&bin, &["tab", "rename", tid, &r.want]) {
-            Ok(_) => {
+        match rename(&herdr, tid, &r.want) {
+            Ok(()) => {
                 labels.set(tid, Value::String(r.want.clone()));
                 tr(&format!("{event}: {tid} -> {}", py::repr_str(&r.want)));
             }
@@ -534,9 +556,9 @@ pub fn run(env: &Env, opts: &Opts, out: &mut dyn std::io::Write) -> Result<(), S
     Ok(())
 }
 
-pub fn main(args: &[String]) -> i32 {
+/// Run with parsed arguments; always 0 (a hook has nowhere to report).
+pub fn main(opts: Args) -> i32 {
     let env = vm::os_env();
-    let opts = parse_args(args);
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     if let Err(e) = run(&env, &opts, &mut out) {
@@ -700,15 +722,5 @@ mod tests {
             Labels::parse(r#"{"k": "Ситуация"}"#).dump(),
             r#"{"k": "Ситуация"}"#
         );
-    }
-
-    #[test]
-    fn args() {
-        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        assert!(parse_args(&s(&["--all"])).all);
-        let o = parse_args(&s(&["--all", "--dry-run"]));
-        assert!(o.all && o.dry_run);
-        assert!(!parse_args(&s(&["--all", "x"])).all);
-        assert!(!parse_args(&s(&[])).all);
     }
 }

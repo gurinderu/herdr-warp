@@ -8,7 +8,12 @@
 //! once it has drawn, and exit when the pinned workspace is closed
 //! (`events.subscribe` for `workspace.closed`).
 
-pub fn main(_args: &[String]) -> i32 {
+/// Keep one herdr client on one workspace (not implemented yet).
+#[derive(argh::FromArgs, Debug, Default, PartialEq)]
+#[argh(subcommand, name = "pin")]
+pub struct Args {}
+
+pub fn main(_args: Args) -> i32 {
     eprintln!("herdr-warp pin: not implemented yet");
     2
 }

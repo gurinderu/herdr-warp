@@ -242,7 +242,13 @@ pub fn run(env: &Env, stream: &mut dyn Write, call: Call, o: &StreamOpts) -> i32
     }
 }
 
-pub fn main(_args: &[String]) -> i32 {
+/// ssh forced command: stream the spool, or focus a pane (VM). Reads
+/// SSH_ORIGINAL_COMMAND.
+#[derive(argh::FromArgs, Debug, Default, PartialEq)]
+#[argh(subcommand, name = "serve")]
+pub struct Args {}
+
+pub fn main() -> i32 {
     let env = vm::os_env();
     let base = Instant::now();
     let monotonic = move || base.elapsed().as_secs_f64();

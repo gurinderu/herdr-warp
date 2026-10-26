@@ -518,47 +518,61 @@ fn options() {
         "/st",
         "--vm-addr",
         "192.0.2.10",
-        "--vm-addr=vm",
+        "--vm-addr",
+        "vm",
     ];
     let c = agent::parse_config(&s(&base)).unwrap();
+    assert_eq!(c.host, "192.0.2.10");
+    assert_eq!(c.user, "user");
+    assert_eq!(c.key, "/k");
+    assert_eq!(c.known_hosts, "/kh");
+    assert_eq!(c.host_key_alias, "vm");
+    assert_eq!(c.state_dir, "/st");
     assert_eq!(c.vm_addr, ["192.0.2.10", "vm"]);
     assert_eq!((c.port, c.max_age, c.jump_window), (22, 900, 600));
     assert!(c.focus_on_click);
     assert_eq!(c.ssh, "/usr/bin/ssh");
+    assert_eq!(c.warp_bundle_prefix, "dev.warp.");
     let mut more = s(&base);
     more.extend(s(&[
         "--no-focus-on-click",
         "--port",
         "2222",
-        "--max-age=60",
-        "--jump",
+        "--max-age",
+        "60",
+        "--jump-window",
         "5",
+        "--ssh",
+        "/bin/ssh",
+        "--warp-bundle-prefix",
+        "x.",
     ]));
     let c = agent::parse_config(&more).unwrap();
     assert!(!c.focus_on_click);
     assert_eq!((c.port, c.max_age, c.jump_window), (2222, 60, 5));
+    assert_eq!(
+        (c.ssh.as_str(), c.warp_bundle_prefix.as_str()),
+        ("/bin/ssh", "x.")
+    );
 
+    // Missing options, a bad number, a stray argument: exit 2, like argparse.
     let e = agent::parse_config(&s(&["--host", "x"])).unwrap_err();
     assert_eq!(e.1, 2);
-    assert!(e.0.contains(
-        "the following arguments are required: --user, --key, --known-hosts, \
-         --host-key-alias, --vm-addr, --state-dir"
-    ));
+    assert!(e.0.contains("--user"), "{}", e.0);
+    let mut no_vm: Vec<String> = s(&base[..12]);
+    no_vm.truncate(12);
+    let e = agent::parse_config(&no_vm).unwrap_err();
+    assert_eq!(e.1, 2);
+    assert!(e.0.contains("--vm-addr"), "{}", e.0);
     let mut bad = s(&base);
     bad.extend(s(&["--port", "x"]));
     let e = agent::parse_config(&bad).unwrap_err();
-    assert!(
-        e.0.contains("argument --port: invalid int value: 'x'"),
-        "{}",
-        e.0
-    );
+    assert_eq!(e.1, 2);
+    assert!(e.0.contains("--port"), "{}", e.0);
     let mut bad = s(&base);
     bad.push("extra".into());
-    assert!(
-        agent::parse_config(&bad)
-            .unwrap_err()
-            .0
-            .contains("unrecognized arguments: extra")
-    );
-    assert_eq!(agent::parse_config(&s(&["-h"])).unwrap_err().1, 0);
+    assert_eq!(agent::parse_config(&bad).unwrap_err().1, 2);
+    let help = agent::parse_config(&s(&["--help"])).unwrap_err();
+    assert_eq!(help.1, 0);
+    assert!(help.0.contains("--jump-window"));
 }

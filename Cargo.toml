@@ -8,6 +8,7 @@ repository = "https://github.com/gurinderu/herdr-warp"
 publish = false
 
 [dependencies]
+argh = "0.1.19"
 libc = "0.2.191"
 serde = "1.0.229"
 serde_json = "1.0.154"

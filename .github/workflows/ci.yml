@@ -1,0 +1,58 @@
+name: "ci"
+
+# The one entry point for PR and main CI. It calls the per-concern workflows
+# (each `on: workflow_call` only) and ends in `pr-ok`, the single check a
+# branch ruleset needs to require: green only when every called job passed.
+#
+#   lints    cargo fmt, cargo clippy (lints.yml)
+#   tests    cargo test on Linux and macOS (tests.yml)
+#   quality  actionlint over the workflows (quality.yml)
+#   build    nix build and nix flake check on x86_64-linux and
+#            aarch64-darwin (build.yml)
+#
+# GitHub-hosted runners only; no secrets.
+on:
+  pull_request:
+    types:
+      - "synchronize"
+      - "opened"
+      - "reopened"
+  push:
+    branches:
+      - "main"
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lints:
+    uses: ./.github/workflows/lints.yml
+
+  tests:
+    uses: ./.github/workflows/tests.yml
+
+  quality:
+    uses: ./.github/workflows/quality.yml
+
+  build:
+    uses: ./.github/workflows/build.yml
+
+  pr-ok:
+    name: "pr-ok"
+    if: always()
+    needs:
+      - lints
+      - tests
+      - quality
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every job passed
+        uses: re-actors/alls-green@b5b5b37504aa4183270bd3d855c52a67f212be35 # v1.3.0
+        with:
+          jobs: ${{ toJSON(needs) }}

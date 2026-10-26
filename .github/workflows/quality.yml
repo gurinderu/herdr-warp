@@ -1,0 +1,24 @@
+name: "quality"
+
+# Called by ci.yml. actionlint comes from the flake's `ci-tools`
+# (.github/actions/setup-tools), pinned by flake.lock so an upstream release
+# cannot change what the gate reads.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  workflows:
+    name: "actionlint"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup project tools
+        uses: ./.github/actions/setup-tools
+
+      - name: actionlint
+        run: actionlint .github/workflows/*.yml

@@ -1,0 +1,29 @@
+name: Setup project tools
+description: >-
+  Install Nix and put the flake's pinned CI tools (flake.lock) on PATH. Steps
+  keep the runner's bash, so actionlint still shellchecks every `run:`.
+inputs:
+  packages:
+    description: Space-separated flake packages whose bin/ goes on PATH
+    default: ci-tools
+runs:
+  using: composite
+  steps:
+    - uses: cachix/install-nix-action@31.11.3
+      with:
+        install_url: https://releases.nixos.org/nix/nix-2.35.2/install
+        enable_kvm: false
+
+    - name: Put the flake's tools on PATH
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+      run: |
+        # Flags, not NIX_CONFIG: install-nix-action exits early on a runner
+        # whose Nix is already installed and may not have flakes enabled.
+        for pkg in $PACKAGES; do
+          link="$RUNNER_TEMP/nix-$pkg"
+          nix --extra-experimental-features 'nix-command flakes' \
+            build ".#$pkg" --no-update-lock-file --out-link "$link"
+          echo "$link/bin" >>"$GITHUB_PATH"
+        done

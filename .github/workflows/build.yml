@@ -1,0 +1,52 @@
+name: "build"
+
+# Called by ci.yml. Builds the flake package (cargo test runs in its check
+# phase) and runs `nix flake check` (test, clippy, fmt) natively on each
+# system the flake exports: x86_64-linux for the VM half, aarch64-darwin
+# (macos-14 is Apple silicon) for the launchd agent.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  nix:
+    name: "nix (${{ matrix.system }})"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-latest
+          - system: aarch64-darwin
+            runner: macos-14
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@31.11.3
+        with:
+          install_url: https://releases.nixos.org/nix/nix-2.35.2/install
+          enable_kvm: false
+
+      - name: Build the package
+        env:
+          SYSTEM: ${{ matrix.system }}
+        run: |
+          nix --extra-experimental-features 'nix-command flakes' \
+            build -L --no-update-lock-file ".#packages.$SYSTEM.default"
+          ls -l result/bin
+
+      - name: Check the flake
+        run: nix --extra-experimental-features 'nix-command flakes' flake check -L --no-update-lock-file
+
+      - name: Evaluate the dev shell
+        env:
+          SYSTEM: ${{ matrix.system }}
+        run: nix --extra-experimental-features 'nix-command flakes' eval --raw --no-update-lock-file ".#devShells.$SYSTEM.default.drvPath"

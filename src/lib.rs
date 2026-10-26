@@ -3,6 +3,7 @@
 
 pub mod hook;
 pub mod py;
+pub mod serve;
 pub mod unicode_tables;
 pub mod vm;
 pub mod wire;

@@ -723,4 +723,111 @@ mod tests {
             r#"{"k": "Ситуация"}"#
         );
     }
+
+    #[test]
+    fn label_edges() {
+        let exact = "x".repeat(32);
+        assert_eq!(
+            label_for(&pane(&exact, "claude")).unwrap(),
+            Some(exact.clone())
+        );
+        // Falsy values that are not strings count as "no title" / "no agent".
+        assert_eq!(
+            label_for(&obj(json!({"terminal_title_stripped": false}))),
+            Ok(None)
+        );
+        assert_eq!(
+            label_for(&obj(json!({"terminal_title_stripped": "Work", "agent": 0}))),
+            Ok(Some("Work".into()))
+        );
+        assert_eq!(
+            label_for(&obj(json!({"terminal_title_stripped": "Work", "agent": 5}))),
+            Ok(Some("Work".into()))
+        );
+    }
+
+    #[test]
+    fn labels_same_and_parse() {
+        let a = Labels::parse(r#"{"x": "1", "y": "2"}"#);
+        assert!(a.same(&Labels::parse(r#"{"y": "2", "x": "1"}"#)));
+        assert!(!a.same(&Labels::parse(r#"{"x": "1", "y": "3"}"#)));
+        assert!(!a.same(&Labels::parse(r#"{"x": "1"}"#)));
+        assert!(!a.same(&Labels::parse(r#"{"x": "1", "z": "2"}"#)));
+        for t in [
+            "5",
+            "-5",
+            "1.5",
+            "true",
+            "\"s\"",
+            "null",
+            "[1]",
+            "",
+            r#"{"a": "b"} x"#,
+        ] {
+            assert_eq!(Labels::parse(t), Labels::default(), "{t}");
+        }
+        assert_eq!(Labels::parse(" {\"a\": \"b\"}\n").dump(), r#"{"a": "b"}"#);
+        let mut l = Labels::default();
+        l.set("a", json!("1"));
+        l.set("b", json!(2));
+        l.set("a", json!("3"));
+        assert_eq!(l.dump(), r#"{"a": "3", "b": 2}"#);
+        l.remove("a");
+        assert_eq!(l.dump(), r#"{"b": 2}"#);
+        l.set("c", json!({"k": [1, "v"]}));
+        assert_eq!(l.dump(), r#"{"b": 2, "c": {"k": [1, "v"]}}"#);
+    }
+
+    #[test]
+    fn plan_duplicates_and_odd_labels() {
+        let s = obj(json!({
+            "tabs": [
+                {"tab_id": "w1:t1", "label": "first"},
+                {"tab_id": "w1:t2", "label": false},
+                {"tab_id": "w1:t1", "label": "1"},
+            ],
+            "panes": [
+                {"pane_id": "w1:p1", "tab_id": "w1:t1", "agent": "claude", "terminal_title_stripped": "Doing"},
+                {"pane_id": "w1:p2", "tab_id": "w1:t2", "agent": "claude", "terminal_title_stripped": "Other"},
+            ],
+        }));
+        // The last tab entry wins (its label "1" is a default); a falsy
+        // label is "" (not a default, not ours: hands off).
+        let mut labels = Labels::parse(r#"{"w1:t2": "mine"}"#);
+        let todo = plan(&s, &mut labels, None).unwrap();
+        assert_eq!(todo.len(), 1);
+        assert_eq!(
+            (
+                todo[0].tab_id.as_str(),
+                todo[0].current.as_str(),
+                todo[0].want.as_str()
+            ),
+            (Some("w1:t1"), "1", "Doing")
+        );
+        assert_eq!(labels, Labels::default());
+        let bad = obj(json!({"tabs": [{"tab_id": "w1:t1", "label": 5}]}));
+        assert_eq!(plan(&bad, &mut Labels::default(), None), Err(Raised));
+        let bad = obj(json!({"tabs": [{"tab_id": ["x"], "label": "1"}]}));
+        assert_eq!(plan(&bad, &mut Labels::default(), None), Err(Raised));
+        let bad = obj(json!({"panes": 5}));
+        assert_eq!(plan(&bad, &mut Labels::default(), None), Err(Raised));
+    }
+
+    #[test]
+    fn focused_pane_per_tab_from_layouts() {
+        let s = obj(json!({
+            "tabs": [{"tab_id": "w1:t1", "label": "1"}, {"tab_id": "w1:t2", "label": "2"}],
+            "layouts": [
+                {"tab_id": "w1:t1", "focused_pane_id": "w1:p2"},
+                {"tab_id": "w1:t2", "focused_pane_id": "w1:p9"},
+            ],
+            "panes": [
+                {"pane_id": "w1:p1", "tab_id": "w1:t1", "agent": "claude", "terminal_title_stripped": "First"},
+                {"pane_id": "w1:p2", "tab_id": "w1:t1", "agent": "claude", "terminal_title_stripped": "Second"},
+            ],
+        }));
+        let todo = plan(&s, &mut Labels::default(), None).unwrap();
+        assert_eq!(todo.len(), 1);
+        assert_eq!(todo[0].want, "Second");
+    }
 }

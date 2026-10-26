@@ -622,4 +622,94 @@ mod tests {
         );
         assert_eq!(dumps(&json!({"t": "Ситуация"})), r#"{"t":"Ситуация"}"#);
     }
+
+    #[test]
+    fn limits_are_the_documented_ones() {
+        assert_eq!(MAX_SEQ, 9_007_199_254_740_991);
+        assert_eq!((MAX_LINE_BYTES, LABEL_MAX, RAW_LABEL_MAX), (1024, 40, 256));
+        assert_eq!((TTL_SECONDS, FUTURE_SKEW), (3600, 300));
+        assert_eq!(status_to_event("done"), Some("done"));
+        assert_eq!(status_to_event("blocked"), Some("needs_input"));
+        assert_eq!(status_to_event("working"), None);
+    }
+
+    #[test]
+    fn ids() {
+        for ok in ["a", "w1:p1", "a_b", "a-b", "Z9", &"x".repeat(32)] {
+            assert!(is_id(ok), "{ok}");
+        }
+        for bad in ["", "a b", "a.b", "é", &"x".repeat(33)] {
+            assert!(!is_id(bad), "{bad}");
+        }
+        assert!(is_term("term_abcdef") && is_term(&format!("term_{}", "0".repeat(32))));
+        assert!(!is_term("term_abcde") && !is_term("term_ABCDEF") && !is_term("abcdef"));
+        assert!(is_code("a_b") && !is_code("") && !is_code("A"));
+        assert!(is_epoch("0123456789abcdef") && !is_epoch("0123456789abcde"));
+    }
+
+    #[test]
+    fn clean_limits() {
+        // Exactly the limit stays as is.
+        let s40 = "y".repeat(40);
+        assert_eq!(cl(&s40), s40);
+        // Only the first 512 characters are looked at, as in Python.
+        let s = format!("{}a{}", "\u{0}".repeat(511), "b".repeat(10));
+        assert_eq!(cl(&s), "a");
+        assert_eq!(clean_str("abcdef", 3), "ab…");
+        assert_eq!(clean_str("ab cdef", 4), "ab…");
+    }
+
+    #[test]
+    fn error_and_focus_lines() {
+        assert_eq!(
+            parse_line(br#"{"v":1,"type":"error","code":"bad_command"}"#, NOW).unwrap(),
+            Msg::Error {
+                code: "bad_command".into()
+            }
+        );
+        assert_eq!(
+            parse_line(br#"{"v":1,"type":"focus","ok":false}"#, NOW).unwrap(),
+            Msg::Focus {
+                ok: false,
+                code: String::new()
+            }
+        );
+        let r = |raw: &[u8]| parse_line(raw, NOW).unwrap().py_repr();
+        assert_eq!(
+            r(br#"{"v":1,"type":"focus","ok":false,"code":"rate_limited"}"#),
+            "{'type': 'focus', 'ok': False, 'code': 'rate_limited'}"
+        );
+        assert_eq!(
+            r(br#"{"v":1,"type":"focus","ok":true,"code":"focused"}"#),
+            "{'type': 'focus', 'ok': True, 'code': 'focused'}"
+        );
+        assert_eq!(
+            r(br#"{"v":1,"type":"hb","head":4}"#),
+            "{'type': 'hb', 'head': 4}"
+        );
+        assert_eq!(
+            r(&ev(json!({"title": "it's"}))),
+            "{'type': 'event', 'seq': 5, 'ts': 1800000000, 'event': 'done', 'agent': 'claude', \
+             'ws': 'w2', 'pane': 'w2:p1', 'tab': 'w2:t1', 'term': 'term_65ead8c4a4dc72', \
+             'ws_label': 'my-project', 'tab_label': '', 'title': \"it's\", 'focused': False}"
+        );
+        assert_eq!(format!("{}", Invalid("why".into())), "why");
+        let e = parse_line(b"[]", NOW).unwrap_err();
+        assert_eq!(e.to_string(), "not an object");
+    }
+
+    #[test]
+    fn ts_window_edges() {
+        assert!(parse_line(&ev(json!({"ts": NOW as i64 - 3600})), NOW).is_ok());
+        assert!(parse_line(&ev(json!({"ts": NOW as i64 + 300})), NOW).is_ok());
+        assert!(parse_line(&ev(json!({"seq": MAX_SEQ})), NOW).is_ok());
+        assert!(parse_line(&ev(json!({"seq": MAX_SEQ + 1})), NOW).is_err());
+        assert!(parse_line(br#"{"v":1,"type":"hb","head":-1}"#, NOW).is_err());
+        let mut line = ev(json!({}));
+        line.truncate(line.len() - 1);
+        line.extend(std::iter::repeat_n(b' ', 1024 - line.len() - 1));
+        line.push(b'}');
+        assert_eq!(line.len(), 1024);
+        assert!(parse_line(&line, NOW).is_ok());
+    }
 }

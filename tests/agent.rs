@@ -576,3 +576,463 @@ fn options() {
     assert_eq!(help.1, 0);
     assert!(help.0.contains("--jump-window"));
 }
+
+// ---------------------------------------------------------------- more
+// Edges found by mutation testing (cargo mutants).
+
+fn script(dir: &std::path::Path, name: &str, body: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let p = dir.join(name);
+    std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    p.display().to_string()
+}
+
+#[test]
+fn rate_limit_refills_one_token_per_ten_seconds() {
+    let (mut a, f) = setup();
+    for seq in 1..=4 {
+        a.handle(&line(json!({"seq": seq, "pane": format!("w1:p{seq}")})));
+    }
+    *f.mono.lock().unwrap() += 10.0;
+    a.handle(&line(json!({"seq": 5, "pane": "w1:p5"})));
+    a.handle(&line(json!({"seq": 6, "pane": "w1:p6"})));
+    assert_eq!(f.writes.lock().unwrap().len(), 4);
+    assert_eq!(a.suppressed, 2);
+}
+
+#[test]
+fn summary_at_most_once_a_minute() {
+    let (mut a, f) = setup();
+    for seq in 1..=5 {
+        a.handle(&line(json!({"seq": seq, "pane": format!("w1:p{seq}")})));
+    }
+    *f.mono.lock().unwrap() = 1061.0;
+    a.maybe_summary();
+    assert_eq!(f.writes.lock().unwrap().len(), 4);
+    a.suppressed = 3;
+    *f.mono.lock().unwrap() = 1062.0;
+    a.maybe_summary();
+    assert_eq!(f.writes.lock().unwrap().len(), 4);
+    *f.mono.lock().unwrap() = 1121.0;
+    a.maybe_summary();
+    assert_eq!(f.writes.lock().unwrap().len(), 5);
+    assert_eq!(a.suppressed, 0);
+    a.maybe_summary(); // nothing held back: nothing sent
+    assert_eq!(f.writes.lock().unwrap().len(), 5);
+}
+
+#[test]
+fn jump_deadline_is_inclusive() {
+    let (mut a, f) = setup();
+    a.handle(&line(json!({})));
+    *f.mono.lock().unwrap() += 600.0;
+    *f.front.lock().unwrap() = Some("dev.warp.Warp-Stable".into());
+    assert!(a.jump_once());
+}
+
+#[test]
+fn jump_waits_while_front_unknown() {
+    let (mut a, f) = setup();
+    a.handle(&line(json!({})));
+    *f.front.lock().unwrap() = Some(String::new());
+    assert!(!a.jump_once());
+    *f.front.lock().unwrap() = None;
+    assert!(!a.jump_once());
+    assert!(a.jump_target().is_some());
+}
+
+#[test]
+fn state_dir_created_private() {
+    use std::os::unix::fs::PermissionsExt;
+    let (mut a, f) = setup();
+    let nested = f.dir.join("a/b");
+    let mut c = cfg(nested.to_str().unwrap());
+    c.focus_on_click = false;
+    let mut a2 = Agent::new(c, a.hooks.clone());
+    a2.handle(br#"{"v":1,"type":"hello","epoch":"0123456789abcdef","head":5}"#);
+    let st = std::fs::read_to_string(nested.join("state.json")).unwrap();
+    assert_eq!(st, r#"{"epoch": "0123456789abcdef", "last_seq": 0}"#);
+    let mode = std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o700);
+    // An existing dir is used as is.
+    a.handle(br#"{"v":1,"type":"hello","epoch":"0123456789abcdef","head":5}"#);
+    assert!(f.dir.join("state.json").exists());
+}
+
+#[test]
+fn bad_state_is_ignored() {
+    let (a, f) = setup();
+    for st in [
+        r#"{"epoch": "XYZ", "last_seq": -1}"#,
+        r#"{"epoch": 5, "last_seq": 9007199254740992}"#,
+        "[]",
+        "nope",
+    ] {
+        std::fs::write(f.dir.join("state.json"), st).unwrap();
+        let b = Agent::new(cfg(f.dir.to_str().unwrap()), a.hooks.clone());
+        assert_eq!((b.epoch.clone(), b.last_seq), (None, 0), "{st}");
+    }
+    std::fs::write(
+        f.dir.join("state.json"),
+        r#"{"epoch": null, "last_seq": 9007199254740991}"#,
+    )
+    .unwrap();
+    let b = Agent::new(cfg(f.dir.to_str().unwrap()), a.hooks.clone());
+    assert_eq!(b.last_seq, 9007199254740991);
+}
+
+#[test]
+fn write_failures_are_drops() {
+    let (mut a, f) = setup();
+    a.hooks.write_tty = Arc::new(|_, _| Err("[Errno 5] Input/output error".into()));
+    a.handle(&line(json!({})));
+    assert!(a.jump_target().is_none());
+    a.hooks.write_tty = Arc::new(|_, _| Ok(false));
+    a.handle(&line(json!({"seq": 6})));
+    assert!(a.jump_target().is_none());
+    assert!(f.writes.lock().unwrap().is_empty());
+}
+
+#[test]
+fn stat_and_write_on_real_files() {
+    let dir = tmpdir("stat");
+    let p = dir.join("f");
+    std::fs::write(&p, "").unwrap();
+    let t = [
+        libc::timespec {
+            tv_sec: 1000,
+            tv_nsec: 500_000_000,
+        },
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+    ];
+    let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+    assert_eq!(
+        unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), t.as_ptr(), 0) },
+        0
+    );
+    let uid = unsafe { libc::getuid() };
+    assert_eq!(
+        agent::stat_tty(p.to_str().unwrap()),
+        Some((false, uid, 1000.5))
+    );
+    let (chr, _, _) = agent::stat_tty("/dev/null").unwrap();
+    assert!(chr);
+    assert_eq!(agent::stat_tty("/nonexistent"), None);
+    // One write, even of nothing.
+    assert_eq!(agent::write_tty("/dev/null", b""), Ok(true));
+    assert_eq!(agent::write_tty("/dev/null", b"abc"), Ok(true));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn run_text_and_front_bundle() {
+    let dir = tmpdir("lsapp");
+    let t = std::time::Duration::from_secs(5);
+    assert_eq!(
+        agent::run_text(&["sh", "-c", "echo hi; exit 1"], t).as_deref(),
+        Some("hi\n")
+    );
+    assert_eq!(agent::run_text(&["/nonexistent/x"], t), None);
+    let lsapp = script(
+        &dir,
+        "lsappinfo",
+        r#"case "$1" in
+  front) echo " ASN:0x0-0x1234: " ;;
+  info) [ "$4" = "ASN:0x0-0x1234:" ] && echo '"CFBundleIdentifier"="dev.warp.Warp-Stable"' ;;
+esac"#,
+    );
+    assert_eq!(
+        agent::front_bundle_with(&lsapp).as_deref(),
+        Some("dev.warp.Warp-Stable")
+    );
+    let blank = script(&dir, "blank", r#"[ "$1" = front ] && echo x"#);
+    assert_eq!(agent::front_bundle_with(&blank).as_deref(), Some(""));
+    assert_eq!(agent::front_bundle_with("/nonexistent/lsappinfo"), None);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn exit_codes_like_python() {
+    use std::process::Command;
+    let st = |c: &str| Command::new("sh").args(["-c", c]).status().unwrap();
+    assert_eq!(agent::py_exit_code(st("exit 3")), 3);
+    assert_eq!(agent::py_exit_code(st("kill -TERM $$")), -15);
+}
+
+#[test]
+fn focus_request_through_fake_ssh() {
+    let dir = tmpdir("ssh");
+    let mut c = cfg(dir.to_str().unwrap());
+    let args = dir.join("args");
+    c.ssh = script(
+        &dir,
+        "ssh",
+        &format!(
+            "printf '%s\\n' \"$@\" > {}\necho '{{\"v\":1,\"type\":\"focus\",\"ok\":true,\"code\":\"focused\"}}'",
+            args.display()
+        ),
+    );
+    assert_eq!(
+        agent::focus_request(&c, "w1:p1", "term_aaaaaaaa").as_deref(),
+        Some("focus w1:p1: {'type': 'focus', 'ok': True, 'code': 'focused'}")
+    );
+    let argv = std::fs::read_to_string(&args).unwrap();
+    assert!(
+        argv.ends_with("user@127.0.0.1\nfocus w1:p1 term_aaaaaaaa\n"),
+        "{argv}"
+    );
+    // Ids that do not validate never reach ssh.
+    std::fs::remove_file(&args).unwrap();
+    assert_eq!(agent::focus_request(&c, "w1:p1;id", "term_aaaaaaaa"), None);
+    assert_eq!(agent::focus_request(&c, "w1:p1", "term_x"), None);
+    assert!(!args.exists());
+    c.ssh = script(&dir, "ssh2", "echo junk; exit 4");
+    assert_eq!(
+        agent::focus_request(&c, "w1:p1", "term_aaaaaaaa").as_deref(),
+        Some("focus w1:p1: exit 4, not json")
+    );
+    c.ssh = dir.join("missing").display().to_string();
+    let msg = agent::focus_request(&c, "w1:p1", "term_aaaaaaaa").unwrap();
+    assert!(
+        msg.starts_with("focus w1:p1: [Errno 2] No such file or directory: '"),
+        "{msg}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn session_runs_ssh_with_the_stream_command() {
+    let (mut a, f) = setup();
+    let args = f.dir.join("args");
+    let mut c = (*a.cfg).clone();
+    c.ssh = script(
+        &f.dir,
+        "ssh",
+        &format!(
+            "printf '%s\\n' \"$@\" >> {}\necho '{{\"v\":1,\"type\":\"hello\",\"epoch\":\"0123456789abcdef\",\"head\":0}}'",
+            args.display()
+        ),
+    );
+    a.cfg = Arc::new(c);
+    assert_eq!(a.session(), Ok("eof"));
+    a.last_seq = 4;
+    assert_eq!(a.session(), Ok("eof"));
+    let argv = std::fs::read_to_string(&args).unwrap();
+    let remotes: Vec<&str> = argv.lines().filter(|l| l.starts_with("stream")).collect();
+    assert_eq!(remotes, ["stream 0", "stream 4 0123456789abcdef"]);
+    let mut c = (*a.cfg).clone();
+    c.ssh = f.dir.join("missing").display().to_string();
+    a.cfg = Arc::new(c);
+    assert!(a.session().unwrap_err().starts_with("[Errno 2]"));
+}
+
+fn bump_later(f: &Fake, ms: u64, now_by: f64, mono_by: f64) -> std::thread::JoinHandle<()> {
+    let (now, mono) = (f.now.clone(), f.mono.clone());
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+        *now.lock().unwrap() += now_by;
+        *mono.lock().unwrap() += mono_by;
+    })
+}
+
+#[test]
+fn session_idle_after_sixty_quiet_seconds() {
+    let (mut a, f) = setup();
+    a.select_seconds = 0.01;
+    let (mut r, w) = pipe();
+    let t = bump_later(&f, 50, 61.0, 61.0);
+    assert_eq!(a.read_session(&mut r), Ok("idle"));
+    t.join().unwrap();
+    drop(w);
+}
+
+#[test]
+fn session_not_idle_at_exactly_sixty() {
+    let (mut a, f) = setup();
+    a.select_seconds = 0.01;
+    let (mut r, w) = pipe();
+    let t = bump_later(&f, 50, 60.0, 60.0);
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(w);
+    });
+    assert_eq!(a.read_session(&mut r), Ok("eof"));
+    t.join().unwrap();
+    closer.join().unwrap();
+}
+
+#[test]
+fn session_wake_when_wall_clock_jumps() {
+    let (mut a, f) = setup();
+    a.select_seconds = 0.01;
+    let (mut r, w) = pipe();
+    let t = bump_later(&f, 50, 31.0, 0.0);
+    assert_eq!(a.read_session(&mut r), Ok("wake"));
+    t.join().unwrap();
+    drop(w);
+    // Exactly 30 s is not a wake.
+    let (mut a, f) = setup();
+    a.select_seconds = 0.01;
+    let (mut r, w) = pipe();
+    let t = bump_later(&f, 50, 30.0, 0.0);
+    let closer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(w);
+    });
+    assert_eq!(a.read_session(&mut r), Ok("eof"));
+    t.join().unwrap();
+    closer.join().unwrap();
+}
+
+#[test]
+fn session_full_length_line_is_kept() {
+    let (mut a, f) = setup();
+    let (mut r, mut w) = pipe();
+    let mut l = line(json!({"seq": 1}));
+    l.truncate(l.len() - 1);
+    l.extend(std::iter::repeat_n(b' ', 1023 - l.len()));
+    l.push(b'}');
+    assert_eq!(l.len(), 1024);
+    let t = std::thread::spawn(move || {
+        w.write_all(&l).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        w.write_all(b"\n").unwrap();
+    });
+    assert_eq!(a.read_session(&mut r), Ok("eof"));
+    t.join().unwrap();
+    assert_eq!(a.last_seq, 1);
+    assert_eq!(f.writes.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn session_flood_thresholds() {
+    // 300 lines a minute is still fine, and so is exactly 64 KiB (newlines
+    // not counted).
+    let (mut a, _f) = setup();
+    let (mut r, mut w) = pipe();
+    let t = std::thread::spawn(move || {
+        for _ in 0..300 {
+            w.write_all(b"g\n").unwrap();
+        }
+    });
+    assert_eq!(a.read_session(&mut r), Ok("eof"));
+    t.join().unwrap();
+    let (mut a, _f) = setup();
+    let (mut r, mut w) = pipe();
+    let t = std::thread::spawn(move || {
+        let l = format!("{}\n", "g".repeat(1024));
+        for _ in 0..64 {
+            w.write_all(l.as_bytes()).unwrap();
+        }
+    });
+    assert_eq!(a.read_session(&mut r), Ok("eof"));
+    t.join().unwrap();
+    // One more byte is a flood.
+    let (mut a, _f) = setup();
+    let (mut r, mut w) = pipe();
+    let t = std::thread::spawn(move || {
+        let l = format!("{}\n", "g".repeat(1024));
+        for _ in 0..64 {
+            w.write_all(l.as_bytes()).unwrap();
+        }
+        let _ = w.write_all(b"g\n");
+    });
+    assert_eq!(a.read_session(&mut r), Ok("flood"));
+    t.join().unwrap();
+}
+
+#[test]
+fn heartbeats_do_not_count_towards_a_flood() {
+    let (mut a, _f) = setup();
+    let (mut r, mut w) = pipe();
+    let t = std::thread::spawn(move || {
+        for _ in 0..400 {
+            w.write_all(b"{\"v\":1,\"type\":\"hb\",\"head\":0}\n")
+                .unwrap();
+        }
+    });
+    assert_eq!(a.read_session(&mut r), Ok("eof"));
+    t.join().unwrap();
+}
+
+#[test]
+fn jitter_stays_in_range() {
+    let mut r = agent::Rng::new();
+    let xs: Vec<f64> = (0..2000).map(|_| r.uniform(0.8, 1.2)).collect();
+    assert!(xs.iter().all(|x| (0.8..1.2).contains(x)));
+    let mean = xs.iter().sum::<f64>() / xs.len() as f64;
+    assert!((mean - 1.0).abs() < 0.02, "{mean}");
+    let lo = xs.iter().filter(|x| **x < 0.9).count();
+    let hi = xs.iter().filter(|x| **x > 1.1).count();
+    assert!(lo > 350 && hi > 350, "{lo} {hi}");
+    let distinct: std::collections::HashSet<u64> = xs.iter().map(|x| x.to_bits()).collect();
+    assert!(distinct.len() > 1990);
+}
+
+#[test]
+fn agent_constants() {
+    assert_eq!(agent::FLOOD_BYTES, 65536);
+    assert_eq!(agent::FLOOD_LINES, 300);
+    assert_eq!(
+        (agent::IDLE_TIMEOUT, agent::WAKE_JUMP, agent::SELECT_SECONDS),
+        (60.0, 30.0, 5.0)
+    );
+}
+
+#[test]
+fn jitter_sequence_is_xorshift64() {
+    let mut r = agent::Rng::seeded(0x1234567);
+    let got: Vec<f64> = (0..3).map(|_| r.uniform(0.8, 1.2)).collect();
+    assert_eq!(
+        got,
+        [0.8004410413403189, 1.0872081133309472, 1.0630209327008988]
+    );
+}
+
+#[test]
+fn stale_edge_is_still_shown() {
+    let (mut a, f) = setup();
+    a.handle(&line(json!({"ts": NOW as i64 - 900})));
+    assert_eq!(f.writes.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn flood_window_resets_each_minute() {
+    let (mut a, f) = setup();
+    let (mut r, mut w) = pipe();
+    let mono = f.mono.clone();
+    let t = std::thread::spawn(move || {
+        for _ in 0..200 {
+            w.write_all(b"g\n").unwrap();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        *mono.lock().unwrap() += 60.0;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        for _ in 0..200 {
+            w.write_all(b"g\n").unwrap();
+        }
+    });
+    a.select_seconds = 0.01;
+    assert_eq!(a.read_session(&mut r), Ok("eof"));
+    t.join().unwrap();
+}
+
+#[test]
+fn tty_write_never_blocks() {
+    // A FIFO with no reader: a blocking open would hang; O_NONBLOCK fails at
+    // once with ENXIO.
+    let dir = tmpdir("fifo");
+    let p = dir.join("fifo");
+    let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let err = agent::write_tty(p.to_str().unwrap(), b"x").unwrap_err();
+    assert!(
+        err.starts_with(&format!("[Errno {}] ", libc::ENXIO)),
+        "{err}"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

@@ -485,4 +485,124 @@ mod tests {
         assert_eq!(realpath("/a/b/../c"), "/a/c");
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn truthy_strings_and_numbers() {
+        assert!(!truthy(Some(&json!(""))));
+        assert!(truthy(Some(&json!("x"))));
+        assert!(!truthy(Some(&json!(0))));
+        assert!(truthy(Some(&json!(2))));
+        assert!(!truthy(Some(&json!(false))));
+        assert!(!truthy(Some(&json!({}))));
+        assert!(truthy(Some(&json!({"a": 1}))));
+        assert!(!truthy(Some(&json!([]))));
+        assert!(!truthy(None));
+    }
+
+    #[test]
+    fn repr_escapes_like_python() {
+        // Non-printables below 0x100, below 0x10000 and above.
+        assert_eq!(repr_str("\u{ad}"), "'\\xad'");
+        assert_eq!(repr_str("a\u{200b}b"), "'a\\u200bb'");
+        assert_eq!(repr_str("\u{e0001}"), "'\\U000e0001'");
+        assert_eq!(repr_str("\u{7f}\t\\"), "'\\x7f\\t\\\\'");
+        assert_eq!(repr_str("\u{10000}"), "'\u{10000}'");
+        assert_eq!(repr_str(""), "''");
+    }
+
+    #[test]
+    fn float_repr_like_python() {
+        let r = |f: f64| repr_value(&json!(f));
+        assert_eq!(r(1.0), "1.0");
+        assert_eq!(r(1.5), "1.5");
+        assert_eq!(r(-3.0), "-3.0");
+        assert_eq!(r(1e15), "1000000000000000.0");
+        assert_eq!(r(123456789012345.0), "123456789012345.0");
+        assert_eq!(r(1e16), "1e+16");
+        assert_eq!(r(1e20), "1e+20");
+        assert_eq!(r(-2.5e22), "-2.5e+22");
+        assert_eq!(r(1e-4), "0.0001");
+        assert_eq!(r(1.5e-5), "1.5e-05");
+        assert_eq!(r(0.0), "0.0");
+        assert_eq!(repr_value(&json!(7)), "7");
+        assert_eq!(
+            repr_value(&json!([1, "a", null, false])),
+            "[1, 'a', None, False]"
+        );
+        assert_eq!(str_value(Some(&json!("x"))), "x");
+        assert_eq!(str_value(None), "None");
+        assert_eq!(str_value(Some(&json!([true]))), "[True]");
+    }
+
+    #[test]
+    fn normpath_like_python() {
+        for (i, o) in [
+            ("", "."),
+            (".", "."),
+            ("./", "."),
+            ("//a", "//a"),
+            ("///a", "/a"),
+            ("//a//b/", "//a/b"),
+            ("a/../..", ".."),
+            ("../a/./b/..", "../a"),
+            ("/..", "/"),
+            ("/a/b/../../..", "/"),
+            ("a/b/", "a/b"),
+            ("//", "//"),
+        ] {
+            assert_eq!(normpath(i), o, "{i:?}");
+        }
+    }
+
+    #[test]
+    fn realpath_relative_dotdot_and_loops() {
+        let cwd = std::env::current_dir().unwrap();
+        let cwd = realpath(cwd.to_str().unwrap());
+        assert_eq!(realpath("x/y"), format!("{cwd}/x/y"));
+        assert_eq!(realpath(""), cwd);
+        assert_eq!(realpath("/a//b/./c/"), "/a/b/c");
+        assert_eq!(realpath("/nonexistent-a/.."), "/");
+        assert_eq!(realpath("/nonexistent-a/./.."), "/");
+        assert_eq!(realpath("/.."), "/");
+        assert_eq!(
+            realpath("../../../x"),
+            normpath(&format!("{cwd}/../../../x"))
+        );
+        let dir = std::env::temp_dir().join(format!("hw-rp2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("d/e")).unwrap();
+        let d = realpath(dir.to_str().unwrap());
+        // A relative link, a link through "..", and a loop.
+        std::os::unix::fs::symlink("d/e", dir.join("rel")).unwrap();
+        std::os::unix::fs::symlink("../d", dir.join("d/e/up")).unwrap();
+        std::os::unix::fs::symlink("loop2", dir.join("loop1")).unwrap();
+        std::os::unix::fs::symlink("loop1", dir.join("loop2")).unwrap();
+        assert_eq!(realpath(&format!("{d}/rel/s")), format!("{d}/d/e/s"));
+        assert_eq!(realpath(&format!("{d}/rel/up/e")), format!("{d}/d/d/e"));
+        assert_eq!(realpath(&format!("{d}/rel/../x")), format!("{d}/d/x"));
+        assert_eq!(realpath(&format!("{d}/loop1/z")), format!("{d}/loop1/z"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn home_and_exists() {
+        assert_eq!(home_dir(Some("/h")), "/h");
+        let pw = home_dir(None);
+        assert!(pw.starts_with('/'), "{pw}");
+        assert_eq!(home_dir(Some("")), pw);
+        assert!(exists("/"));
+        assert!(!exists("/nonexistent/x"));
+    }
+
+    #[test]
+    fn os_error_text() {
+        let e = std::io::Error::from_raw_os_error(libc::ENOENT);
+        assert_eq!(os_error(&e, None), "[Errno 2] No such file or directory");
+        assert_eq!(
+            os_error(&e, Some("/x")),
+            "[Errno 2] No such file or directory: '/x'"
+        );
+        let other = std::io::Error::other("boom");
+        assert_eq!(os_error(&other, None), "boom");
+    }
 }

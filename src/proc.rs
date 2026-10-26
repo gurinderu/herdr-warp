@@ -98,5 +98,12 @@ mod tests {
             Err(RunError::Spawn(_))
         ));
         assert_eq!(local_timestamp().len(), 19);
+        // Waits for a slower child instead of timing it out at once.
+        let out = run(
+            &argv(&["sh", "-c", "sleep 0.3; echo late"]),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(out.stdout, b"late\n");
     }
 }

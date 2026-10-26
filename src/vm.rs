@@ -512,4 +512,32 @@ mod tests {
             PathBuf::from("/h/.config/herdr/herdr.sock")
         );
     }
+
+    #[test]
+    fn py_json_escapes_and_separators() {
+        assert_eq!(
+            request_line_id(
+                "x",
+                "m\u{e9}\u{1}~ \u{7f}\u{1f600}",
+                &json!({"a": [1, 2], "b": {"c": "\n", "d": 2}})
+            ),
+            "{\"id\": \"x\", \"method\": \"m\\u00e9\\u0001~ \\u007f\\ud83d\\ude00\", \
+             \"params\": {\"a\": [1, 2], \"b\": {\"c\": \"\\n\", \"d\": 2}}}\n"
+        );
+        assert_eq!(py_json(&json!([])), "[]");
+        assert_eq!(
+            py_json(&json!(["\"\\\r\t\u{8}\u{c}"])),
+            r#"["\"\\\r\t\b\f"]"#
+        );
+    }
+
+    #[test]
+    fn limits_and_env() {
+        assert_eq!((MAX_ENTRIES, MAX_BYTES), (64, 32768));
+        assert_eq!(MAX_REPLY_BYTES, 16 << 20);
+        assert!(now() > 1.7e9);
+        let env = os_env();
+        assert_eq!(env.get("PATH"), std::env::var("PATH").ok().as_ref());
+        assert!(!env.is_empty());
+    }
 }

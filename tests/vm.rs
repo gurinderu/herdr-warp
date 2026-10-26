@@ -635,3 +635,364 @@ fn herdr_call_times_out() {
     assert!(start.elapsed() < std::time::Duration::from_millis(2900));
     t.join().unwrap();
 }
+
+// ---------------------------------------------------------------- more
+// Edges found by mutation testing (cargo mutants).
+
+#[test]
+fn tab_and_workspace_matched_by_id() {
+    let b = base();
+    let mut snap = snapshot();
+    snap["tabs"] =
+        json!([{"tab_id": "w9:t9", "label": "wrong"}, {"tab_id": "w2:t1", "label": "web"}]);
+    snap["workspaces"] = json!([{"workspace_id": "w9", "label": "nope"}, {"workspace_id": "w2", "label": "my-project"}]);
+    b.run_hook(&herdr_event("blocked", "w2:p1"), snap);
+    let e = &b.entries()[0];
+    assert_eq!(
+        (e["tab_label"].as_str(), e["ws_label"].as_str()),
+        (Some("web"), Some("my-project"))
+    );
+}
+
+#[test]
+fn unhashable_status_leaves_spool_alone() {
+    let b = base();
+    b.run_hook(&herdr_event("blocked", "w2:p1"), snapshot());
+    let ev = json!({"data": {"pane_id": "w2:p1", "agent_status": ["x"]}}).to_string();
+    assert!(b.run_hook(&ev, snapshot()).is_empty());
+    assert_eq!(b.entries().len(), 1);
+}
+
+#[test]
+fn entries_sorted_filtered_and_read_capped() {
+    let b = base();
+    std::fs::create_dir_all(&b.spool.dir).unwrap();
+    let lines = [
+        r#"{"seq":3,"ts":1,"pane":"a"}"#,
+        r#"{"seq":1,"ts":1,"pane":"b"}"#,
+        r#"{"seq":2,"ts":1}"#,
+        r#"{"seq":"4","ts":1,"pane":"c"}"#,
+        r#"{"seq":5,"ts":1.5,"pane":"c"}"#,
+        r#"{"seq":6,"ts":1,"pane":7}"#,
+        r#"{"ts":1,"pane":"d"}"#,
+        r#"[1]"#,
+        r#"garbage"#,
+        r#"{"seq":2,"ts":1,"pane":"e"}"#,
+    ];
+    std::fs::write(&b.spool.path, lines.join("\r\n")).unwrap();
+    let seqs: Vec<i64> = b
+        .spool
+        .entries()
+        .iter()
+        .map(|e| e["seq"].as_i64().unwrap())
+        .collect();
+    assert_eq!(seqs, [1, 2, 3]);
+    // Only the first MAX_BYTES * 4 bytes are read (a partial last line is
+    // dropped), as in the Python.
+    let line = format!(
+        "{{\"seq\":1,\"ts\":1,\"pane\":\"p\",\"x\":\"{}\"}}\n",
+        "y".repeat(1000)
+    );
+    std::fs::write(&b.spool.path, line.repeat(200)).unwrap();
+    assert_eq!(b.spool.entries().len(), MAX_BYTES * 4 / line.len());
+}
+
+#[test]
+fn byte_cap_keeps_the_newest_that_fit() {
+    let b = base();
+    for i in 0..40 {
+        let mut r = b.rec(&format!("w1:p{i}"));
+        r.insert("x".into(), json!("z".repeat(1200)));
+        b.spool.append(r).unwrap();
+    }
+    let data = std::fs::read(&b.spool.path).unwrap();
+    let es = b.entries();
+    let one = data.len() / es.len();
+    assert!(data.len() <= MAX_BYTES);
+    // One more line would not have fitted.
+    assert!(
+        data.len() + one > MAX_BYTES,
+        "{} entries, {} bytes",
+        es.len(),
+        data.len()
+    );
+    assert_eq!(es.last().unwrap()["seq"], 40);
+    let seqs: Vec<i64> = es.iter().map(|e| e["seq"].as_i64().unwrap()).collect();
+    assert_eq!(seqs, (41 - es.len() as i64..41).collect::<Vec<_>>());
+}
+
+#[test]
+fn ttl_edge_is_kept() {
+    let b = base();
+    b.spool.append(b.rec("w1:p1")).unwrap();
+    b.now.set(b.now.get() + 3600.0);
+    b.spool.append(b.rec("w1:p2")).unwrap();
+    assert_eq!(b.entries().len(), 2);
+}
+
+#[test]
+fn bad_meta_gets_a_fresh_epoch() {
+    let b = base();
+    std::fs::create_dir_all(&b.spool.dir).unwrap();
+    for meta in [
+        r#"{"epoch": "0123456789abcdef", "next_seq": 0}"#,
+        r#"{"epoch": "nothex", "next_seq": 5}"#,
+        r#"{"epoch": "0123456789abcdef", "next_seq": 9007199254740992}"#,
+    ] {
+        std::fs::write(&b.spool.meta_path, meta).unwrap();
+        let (epoch, head, _) = b.spool.snapshot().unwrap();
+        assert_ne!(epoch, "0123456789abcdef", "{meta}");
+        assert_eq!(head, 0);
+    }
+    std::fs::write(
+        &b.spool.meta_path,
+        r#"{"epoch": "0123456789abcdef", "next_seq": 7}"#,
+    )
+    .unwrap();
+    assert_eq!(b.spool.snapshot().unwrap().1, 6);
+}
+
+#[test]
+fn spool_dir_that_is_a_file_fails() {
+    let b = base();
+    std::fs::create_dir_all(b.spool.dir.parent().unwrap()).unwrap();
+    std::fs::write(&b.spool.dir, "").unwrap();
+    assert!(b.spool.locked(true).is_err());
+    assert!(b.spool.append(b.rec("w1:p1")).is_err());
+}
+
+fn set_mtime(p: &Path, sec: i64, nsec: i64) {
+    let t = [
+        libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        },
+        libc::timespec {
+            tv_sec: sec as _,
+            tv_nsec: nsec as _,
+        },
+    ];
+    let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+    assert_eq!(
+        unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), t.as_ptr(), 0) },
+        0
+    );
+}
+
+#[test]
+fn stamp_sees_every_mtime_change() {
+    let b = base();
+    assert!(b.spool.stamp().is_none());
+    b.spool.append(b.rec("w1:p1")).unwrap();
+    let mut seen = Vec::new();
+    for (s, ns) in [(1, 0), (0, 1), (0, 0), (2, 0)] {
+        set_mtime(&b.spool.path, s, ns);
+        seen.push(b.spool.stamp().unwrap());
+    }
+    for (i, x) in seen.iter().enumerate() {
+        for y in &seen[i + 1..] {
+            assert_ne!(x, y);
+        }
+    }
+    set_mtime(&b.spool.meta_path, 5, 0);
+    let a = b.spool.stamp().unwrap();
+    set_mtime(&b.spool.meta_path, 5, 1);
+    assert_ne!(a, b.spool.stamp().unwrap());
+}
+
+#[test]
+fn heartbeat_only_after_its_interval() {
+    let b = base();
+    let count_hb = |hb: f64, max: f64| {
+        // Not from zero, so `now - start` and `now + start` differ.
+        let ticks = Cell::new(100.0);
+        let mono = || ticks.get();
+        let sleep = |_| ticks.set(ticks.get() + 1.0);
+        let o = StreamOpts {
+            clock: &vm::now,
+            monotonic: &mono,
+            sleep: &sleep,
+            max_seconds: max,
+            hb_seconds: hb,
+        };
+        let mut out = Vec::new();
+        serve::run_stream(0, None, &b.spool, &mut out, &o).unwrap();
+        lines(&out).iter().filter(|l| l["type"] == "hb").count()
+    };
+    assert_eq!(count_hb(5.0, 4.0), 0);
+    assert_eq!(count_hb(5.0, 5.0), 1);
+    assert_eq!(count_hb(2.0, 7.0), 3);
+}
+
+#[test]
+fn stream_sends_fresh_entries_at_the_ttl_edge() {
+    let b = base();
+    b.spool.append(b.rec("w1:p1")).unwrap();
+    b.now.set(b.now.get() + 3600.0);
+    assert_eq!(event_seqs(&b.stream(0, None)), [1]);
+}
+
+#[test]
+fn focus_rate_limit_edge() {
+    let b = base();
+    let call = |_: &Path, m: &str, _: Value| {
+        if m == "pane.get" {
+            Some(json!({"result": {"pane": {"terminal_id": "term_aaaaaaaa"}}}))
+        } else {
+            Some(json!({"result": {}}))
+        }
+    };
+    std::fs::create_dir_all(&b.spool.dir).unwrap();
+    let last = b.spool.dir.join("focus.last");
+    File::create(&last).unwrap();
+    set_mtime(&last, 1000, 0);
+    let mut s = Vec::new();
+    let at = |t: f64| move || t;
+    // Exactly one second later is allowed again.
+    let rc = serve::run_focus(
+        "w1:p1",
+        "term_aaaaaaaa",
+        &b.spool,
+        &mut s,
+        &call,
+        &at(1001.0),
+        &b.env,
+    )
+    .unwrap();
+    assert_eq!((rc, lines(&s)[0]["code"].as_str()), (0, Some("focused")));
+    set_mtime(&last, 1000, 0);
+    let mut s = Vec::new();
+    serve::run_focus(
+        "w1:p1",
+        "term_aaaaaaaa",
+        &b.spool,
+        &mut s,
+        &call,
+        &at(1000.9),
+        &b.env,
+    )
+    .unwrap();
+    assert_eq!(lines(&s)[0]["code"], "rate_limited");
+}
+
+/// A writer that fails like a full disk, not like a vanished reader.
+struct Broken(std::io::ErrorKind);
+
+impl Write for Broken {
+    fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+        Err(std::io::Error::from(self.0))
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn write_errors_exit_codes() {
+    let b = base();
+    let mut env = b.env.clone();
+    env.insert("SSH_ORIGINAL_COMMAND".into(), "stream 0".into());
+    let o = opts(0.0, &vm::now);
+    assert_eq!(
+        serve::run(
+            &env,
+            &mut Broken(std::io::ErrorKind::BrokenPipe),
+            &no_call,
+            &o
+        ),
+        0
+    );
+    assert_eq!(
+        serve::run(
+            &env,
+            &mut Broken(std::io::ErrorKind::ConnectionReset),
+            &no_call,
+            &o
+        ),
+        0
+    );
+    assert_eq!(
+        serve::run(
+            &env,
+            &mut Broken(std::io::ErrorKind::PermissionDenied),
+            &no_call,
+            &o
+        ),
+        1
+    );
+    env.insert("SSH_ORIGINAL_COMMAND".into(), "nope".into());
+    assert_eq!(
+        serve::run(
+            &env,
+            &mut Broken(std::io::ErrorKind::PermissionDenied),
+            &no_call,
+            &o
+        ),
+        1
+    );
+}
+
+#[test]
+fn constants() {
+    assert_eq!(serve::MAX_STREAM_SECONDS, 43200.0);
+    assert_eq!(
+        (
+            serve::POLL_SECONDS,
+            serve::HB_SECONDS,
+            serve::FOCUS_MIN_INTERVAL
+        ),
+        (1.0, 20.0, 1.0)
+    );
+    assert_eq!(hook::DEBOUNCE_SECONDS, 1.5);
+}
+
+#[test]
+fn herdr_request_errors_are_told_apart() {
+    let b = base();
+    let sock = vm::default_socket(&b.env);
+    let t = std::time::Duration::from_secs(1);
+    assert!(matches!(
+        vm::herdr_request(&sock, "x", "m", &json!({}), t),
+        Err(vm::CallError::Connect(_))
+    ));
+    let srv = UnixListener::bind(&sock).unwrap();
+    let th = std::thread::spawn(move || {
+        for reply in [
+            &b"not json\n"[..],
+            b"",
+            b"{\"result\": 1}\n{\"second\": 2}\n",
+        ] {
+            let (mut c, _) = srv.accept().unwrap();
+            let mut l = String::new();
+            BufReader::new(c.try_clone().unwrap())
+                .read_line(&mut l)
+                .unwrap();
+            c.write_all(reply).unwrap();
+        }
+    });
+    assert!(matches!(
+        vm::herdr_request(&sock, "x", "m", &json!({}), t),
+        Err(vm::CallError::Exchange(_))
+    ));
+    assert!(vm::herdr_call(&sock, "m", json!({})).is_none());
+    assert_eq!(
+        vm::herdr_call(&sock, "m", json!({})),
+        Some(json!({"result": 1}))
+    );
+    th.join().unwrap();
+}
+
+#[test]
+fn byte_cap_drops_as_many_as_it_takes() {
+    let b = base();
+    for i in 0..30 {
+        let mut r = b.rec(&format!("w1:p{i}"));
+        r.insert("x".into(), json!("s".repeat(900)));
+        b.spool.append(r).unwrap();
+    }
+    let mut big = b.rec("w2:p0");
+    big.insert("x".into(), json!("B".repeat(20000)));
+    b.spool.append(big).unwrap();
+    assert!(std::fs::metadata(&b.spool.path).unwrap().len() as usize <= MAX_BYTES);
+    assert_eq!(b.entries().last().unwrap()["pane"], "w2:p0");
+}

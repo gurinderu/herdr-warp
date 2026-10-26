@@ -14,5 +14,10 @@ serde = "1.0.229"
 serde_json = "1.0.154"
 unicode-normalization = "0.1.26"
 
+# Hooks run on every herdr event: start fast, stay small.
 [profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
 strip = true

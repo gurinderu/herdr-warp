@@ -996,3 +996,16 @@ fn byte_cap_drops_as_many_as_it_takes() {
     assert!(std::fs::metadata(&b.spool.path).unwrap().len() as usize <= MAX_BYTES);
     assert_eq!(b.entries().last().unwrap()["pane"], "w2:p0");
 }
+
+#[test]
+fn record_bigger_than_the_cap_leaves_an_empty_spool() {
+    // As in the Python: lines are dropped oldest first until it fits, and a
+    // lone oversized line does not fit at all.
+    let b = base();
+    b.spool.append(b.rec("w1:p1")).unwrap();
+    let mut big = b.rec("w1:p2");
+    big.insert("x".into(), json!("B".repeat(MAX_BYTES)));
+    assert_eq!(b.spool.append(big).unwrap(), 2);
+    assert_eq!(std::fs::metadata(&b.spool.path).unwrap().len(), 0);
+    assert_eq!(b.spool.snapshot().unwrap().1, 2);
+}
